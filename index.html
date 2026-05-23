@@ -1,0 +1,427 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Fishes Schooling — Vicsek + Underwater</title>
+<style>
+  html, body { margin: 0; background: #021019; color: #cfd; font: 13px/1.4 ui-monospace, Menlo, monospace; overflow: hidden; }
+  canvas { display: block; }
+  .stack { position: fixed; inset: 0; pointer-events: none; }
+  #stage, #fx, #order { position: absolute; left: 0; top: 0; }
+  #order { left: auto; right: 14px; top: 14px; pointer-events: auto; border: 1px solid #1a3a4a; border-radius: 6px; background: rgba(2,12,20,0.6); }
+  .panel { position: fixed; top: 14px; left: 14px; padding: 12px 14px; background: rgba(2,16,25,0.7); border: 1px solid #1a3a4a; border-radius: 6px; backdrop-filter: blur(6px); pointer-events: auto; max-width: 320px; }
+  .panel strong { color: #6fd6ff; letter-spacing: .04em; }
+  label { display: block; margin: 6px 0; color: #9cc; }
+  input[type=range] { width: 170px; vertical-align: middle; accent-color: #2db; }
+  .v { display: inline-block; width: 44px; text-align: right; color: #fff; font-variant-numeric: tabular-nums; }
+  .row { display: flex; gap: 6px; margin-top: 10px; }
+  button { background: #1a3a4a; color: #cfd; border: 1px solid #2db; border-radius: 4px; padding: 4px 10px; font: inherit; cursor: pointer; }
+  button:hover { background: #2db; color: #021019; }
+  button:disabled { opacity: 0.4; cursor: wait; }
+  .hint { color: #678; font-size: 11px; margin-top: 8px; }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 999px; background: #143040; color: #6fd6ff; font-size: 11px; margin-left: 4px; }
+</style>
+</head>
+<body>
+<canvas id="bg"    width="1920" height="1080"></canvas>
+<canvas id="stage" width="1920" height="1080"></canvas>
+<canvas id="fx"    width="1920" height="1080"></canvas>
+<canvas id="order" width="320"  height="180"></canvas>
+
+<div class="panel">
+  <strong>FISHES · Vicsek model</strong><span class="pill" id="phi-pill">φ=—</span>
+  <label>Fish              <input id="n"  type="range" min="20"  max="600" value="200"><span class="v" id="nv">200</span></label>
+  <label>Alignment R       <input id="ar" type="range" min="10"  max="120" value="50"><span class="v" id="arv">50</span></label>
+  <label>Cohesion          <input id="c"  type="range" min="0"   max="80"  value="40"><span class="v" id="cv">40</span></label>
+  <label>Separation        <input id="s"  type="range" min="0"   max="40"  value="14"><span class="v" id="sv">14</span></label>
+  <label>Noise η (rad)     <input id="e"  type="range" min="0"   max="6.28" step="0.01" value="0.25"><span class="v" id="ev">0.25</span></label>
+  <label>Speed             <input id="sp" type="range" min="1"   max="6" value="3" step="0.1"><span class="v" id="spv">3.0</span></label>
+  <label>Trail fade        <input id="tf" type="range" min="0.03" max="1" step="0.01" value="0.18"><span class="v" id="tfv">0.18</span></label>
+  <div class="row">
+    <button id="sweep">Sweep η → φ curve</button>
+    <button id="reset">Reset</button>
+  </div>
+  <div class="hint">η is heading noise added per step. Low η → ordered school. High η → disordered swarm. Watch φ on the top-right.</div>
+</div>
+
+<script>
+// =================== CANVAS SETUP ===================
+const stage = document.getElementById('stage');
+const bg    = document.getElementById('bg');
+const fx    = document.getElementById('fx');
+const order = document.getElementById('order');
+const sctx = stage.getContext('2d');
+const bctx = bg.getContext('2d');
+const fctx = fx.getContext('2d');
+const octx = order.getContext('2d');
+
+// Fit to viewport
+function resize() {
+  const W = window.innerWidth, H = window.innerHeight;
+  for (const c of [stage, bg, fx]) { c.width = W; c.height = H; c.style.width = W+'px'; c.style.height = H+'px'; }
+}
+resize();
+window.addEventListener('resize', resize);
+
+// =================== PARAMETERS ===================
+const colors = ['#ffb86b','#ff6b7a','#e8f5ff','#9cdcfe'];
+const P = {
+  n: 200, alignR: 50, cohesion: 40, separation: 14,
+  eta: 0.25, speedLimit: 3.0, trailFade: 0.18,
+  cohesionWeight: 20, separationWeight: 18, alignmentWeight: 6,
+  speedFactorCohesion: 100, speedFactorSeparation: 5,
+  turnRateLimit: Math.PI / 18, cohesionThreshold: 25,
+};
+
+// =================== FISH ===================
+class Fish {
+  constructor() {
+    this.x = Math.random() * stage.width;
+    this.y = Math.random() * stage.height;
+    this.dir = Math.random() * 2 * Math.PI - Math.PI;
+    this.speed = 1; this.turn = 0;
+    this.color = colors[Math.floor(Math.random() * colors.length)];
+  }
+}
+let fishes = [];
+function resetFish() { fishes = Array.from({length: P.n}, () => new Fish()); }
+resetFish();
+
+// =================== UI BINDING ===================
+function bind(id, key, fmt = v => v) {
+  const el  = document.getElementById(id);
+  const out = document.getElementById(id + 'v');
+  out.textContent = fmt(P[key]);
+  el.value = P[key];
+  el.addEventListener('input', () => {
+    P[key] = parseFloat(el.value);
+    out.textContent = fmt(P[key]);
+    if (key === 'n') resetFish();
+  });
+}
+bind('n',  'n',          v => v|0);
+bind('ar', 'alignR',     v => v|0);
+bind('c',  'cohesion',   v => v|0);
+bind('s',  'separation', v => v|0);
+bind('e',  'eta',        v => v.toFixed(2));
+bind('sp', 'speedLimit', v => v.toFixed(1));
+bind('tf', 'trailFade',  v => v.toFixed(2));
+
+document.getElementById('reset').onclick = resetFish;
+
+// =================== ORDER PARAMETER ===================
+// Vicsek order parameter φ = |1/N Σ v_i / |v_i||
+function computeOrder() {
+  let sx = 0, sy = 0;
+  for (const f of fishes) { sx += Math.cos(f.dir); sy += Math.sin(f.dir); }
+  return Math.hypot(sx, sy) / fishes.length;
+}
+
+const phiHistory = new Array(320).fill(0);
+const phiPill = document.getElementById('phi-pill');
+function drawOrder() {
+  octx.fillStyle = 'rgba(2,16,25,0.85)';
+  octx.fillRect(0, 0, order.width, order.height);
+
+  // Grid
+  octx.strokeStyle = '#143040';
+  octx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = i * order.height / 4;
+    octx.beginPath(); octx.moveTo(0, y); octx.lineTo(order.width, y); octx.stroke();
+  }
+  // Labels
+  octx.fillStyle = '#6fd6ff';
+  octx.font = '11px ui-monospace';
+  octx.fillText('φ (order parameter)', 8, 14);
+  octx.fillText('1', 4, 28);
+  octx.fillText('0', 4, order.height - 4);
+
+  // Sparkline
+  octx.strokeStyle = '#2db';
+  octx.lineWidth = 1.5;
+  octx.beginPath();
+  for (let i = 0; i < phiHistory.length; i++) {
+    const y = order.height - phiHistory[i] * (order.height - 8) - 4;
+    if (i === 0) octx.moveTo(i, y); else octx.lineTo(i, y);
+  }
+  octx.stroke();
+
+  // Current value
+  const phi = phiHistory[phiHistory.length - 1];
+  phiPill.textContent = `φ=${phi.toFixed(3)}`;
+}
+
+// =================== SIMULATION STEP ===================
+function step() {
+  const alignR2 = P.alignR * P.alignR;
+  const cohR2   = P.cohesion * P.cohesion;
+  const sepR    = P.separation;
+  const sepR2   = sepR * sepR;
+
+  // Pass 1: compute steering per fish
+  const newDirs = new Float32Array(fishes.length);
+  const newSpeeds = new Float32Array(fishes.length);
+
+  for (let i = 0; i < fishes.length; i++) {
+    const f = fishes[i];
+    let speed = 1, turn = 0;
+
+    let cohCount = 0, cx = 0, cy = 0;
+    let alignSx = 0, alignSy = 0, alignCount = 0;
+    let closest = null, closestD2 = Infinity;
+
+    for (let j = 0; j < fishes.length; j++) {
+      if (i === j) continue;
+      const o = fishes[j];
+      const dx = f.x - o.x, dy = f.y - o.y;
+      const d2 = dx*dx + dy*dy;
+      if (d2 < alignR2) { alignSx += Math.cos(o.dir); alignSy += Math.sin(o.dir); alignCount++; }
+      if (d2 < cohR2)   { cohCount++; cx += o.x; cy += o.y; }
+      if (d2 < closestD2) { closestD2 = d2; closest = o; }
+    }
+
+    // Cohesion
+    if (cohCount > 0) {
+      cx /= cohCount; cy /= cohCount;
+      const d = Math.hypot(f.x - cx, f.y - cy);
+      if (d > P.cohesionThreshold) {
+        const angle = Math.atan2(f.y - cy, f.x - cx);
+        turn += (angle - f.dir) / P.cohesionWeight;
+        speed += d / P.speedFactorCohesion;
+      }
+    }
+    // Separation
+    if (closest && closestD2 < sepR2) {
+      const dC = Math.sqrt(closestD2);
+      const angle = Math.atan2(f.y - closest.y, f.x - closest.x);
+      turn -= (angle - f.dir) / P.separationWeight;
+      speed += P.speedFactorSeparation / Math.max(dC, 0.01);
+    }
+    // Alignment (Vicsek-style: avg neighbor heading)
+    let targetDir = f.dir;
+    if (alignCount > 0) {
+      targetDir = Math.atan2(alignSy, alignSx);
+      // Blend toward target heading
+      let delta = targetDir - f.dir;
+      while (delta >  Math.PI) delta -= 2 * Math.PI;
+      while (delta < -Math.PI) delta += 2 * Math.PI;
+      turn += delta / P.alignmentWeight;
+    }
+
+    // Clamp turn
+    if (turn >  P.turnRateLimit) turn =  P.turnRateLimit;
+    if (turn < -P.turnRateLimit) turn = -P.turnRateLimit;
+
+    // Vicsek noise: add uniform random perturbation in [-η/2, η/2]
+    const noise = (Math.random() - 0.5) * P.eta;
+
+    newDirs[i] = f.dir + turn + noise;
+    newSpeeds[i] = Math.min(speed, P.speedLimit);
+  }
+
+  // Pass 2: integrate position
+  for (let i = 0; i < fishes.length; i++) {
+    const f = fishes[i];
+    f.turn = newDirs[i] - f.dir;
+    f.dir = newDirs[i];
+    f.speed = newSpeeds[i];
+
+    f.x -= Math.cos(f.dir) * f.speed;
+    f.y -= Math.sin(f.dir) * f.speed;
+
+    if (f.dir >  Math.PI) f.dir -= 2 * Math.PI;
+    if (f.dir < -Math.PI) f.dir += 2 * Math.PI;
+
+    if (f.x > stage.width)  f.x = 0; else if (f.x < 0) f.x = stage.width;
+    if (f.y > stage.height) f.y = 0; else if (f.y < 0) f.y = stage.height;
+  }
+}
+
+// =================== RENDER: BACKGROUND (gradient + caustics) ===================
+let bgT = 0;
+function drawBackground() {
+  bgT += 0.006;
+  const W = bg.width, H = bg.height;
+  // Gradient — deep teal at top, near-black at bottom (looking down into depth)
+  const g = bctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0,    '#063545');
+  g.addColorStop(0.45, '#031c2a');
+  g.addColorStop(1,    '#010a12');
+  bctx.fillStyle = g;
+  bctx.fillRect(0, 0, W, H);
+
+  // Caustics: a few overlapping sine bands sliding across, additive
+  bctx.save();
+  bctx.globalCompositeOperation = 'lighter';
+  const bands = 5;
+  for (let i = 0; i < bands; i++) {
+    const phase = bgT * (0.4 + i * 0.2) + i * 1.7;
+    const y = H * (0.15 + 0.7 * (0.5 + 0.5 * Math.sin(phase)));
+    const grad = bctx.createRadialGradient(W * 0.5 + Math.cos(phase * 0.6) * W * 0.3, y, 0,
+                                            W * 0.5 + Math.cos(phase * 0.6) * W * 0.3, y, W * 0.55);
+    grad.addColorStop(0,   'rgba(80,180,200,0.08)');
+    grad.addColorStop(0.5, 'rgba(40,100,140,0.025)');
+    grad.addColorStop(1,   'rgba(0,0,0,0)');
+    bctx.fillStyle = grad;
+    bctx.fillRect(0, 0, W, H);
+  }
+  bctx.restore();
+}
+
+// =================== RENDER: BUBBLES ===================
+const bubbles = [];
+function spawnBubbles() {
+  if (Math.random() < 0.25 && bubbles.length < 60) {
+    bubbles.push({
+      x: Math.random() * fx.width,
+      y: fx.height + 5,
+      r: 1 + Math.random() * 3,
+      vy: 0.4 + Math.random() * 1.2,
+      wob: Math.random() * 100,
+    });
+  }
+}
+function drawBubbles() {
+  fctx.save();
+  fctx.globalCompositeOperation = 'lighter';
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.y -= b.vy;
+    b.x += Math.sin((b.y + b.wob) * 0.03) * 0.4;
+    fctx.beginPath();
+    fctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    fctx.fillStyle = 'rgba(170,220,255,0.35)';
+    fctx.fill();
+    fctx.strokeStyle = 'rgba(220,240,255,0.5)';
+    fctx.lineWidth = 0.6;
+    fctx.stroke();
+    if (b.y < -10) bubbles.splice(i, 1);
+  }
+  fctx.restore();
+}
+
+// =================== RENDER: FISH ===================
+function drawFish(f) {
+  sctx.save();
+  sctx.translate(f.x, f.y);
+  sctx.rotate(f.dir);
+
+  // Flex factor — bend body away from turn direction
+  const flex = Math.max(-1, Math.min(1, f.turn * 14));
+  const topY = 7 - flex * 4;
+  const botY = -7 - flex * 4;
+
+  sctx.strokeStyle = f.color;
+  sctx.lineWidth = 1.3;
+  sctx.beginPath();
+  sctx.moveTo(0, 0);
+  sctx.bezierCurveTo(10, topY, 15, -flex * 2, 25, 0);
+  sctx.moveTo(0, 0);
+  sctx.bezierCurveTo(10, botY, 15, -flex * 2, 25, 0);
+  sctx.stroke();
+  // Tail fins
+  sctx.beginPath();
+  sctx.moveTo(7,  3); sctx.lineTo(12,  8);
+  sctx.moveTo(7, -3); sctx.lineTo(12, -8);
+  sctx.stroke();
+  sctx.restore();
+}
+
+// =================== MAIN LOOP ===================
+let frames = 0;
+function frame() {
+  drawBackground();
+
+  // Motion trails — alpha-fade instead of full clear
+  sctx.fillStyle = `rgba(2,16,25,${P.trailFade})`;
+  sctx.fillRect(0, 0, stage.width, stage.height);
+
+  step();
+  for (const f of fishes) drawFish(f);
+
+  // FX layer: bubbles (clear + redraw)
+  fctx.clearRect(0, 0, fx.width, fx.height);
+  spawnBubbles();
+  drawBubbles();
+
+  // Order parameter — update every other frame for smoother sparkline
+  if ((frames++ % 2) === 0) {
+    const phi = computeOrder();
+    phiHistory.shift(); phiHistory.push(phi);
+    drawOrder();
+  }
+
+  requestAnimationFrame(frame);
+}
+
+// =================== PHASE-TRANSITION SWEEP ===================
+const sweepBtn = document.getElementById('sweep');
+let sweepData = null;
+sweepBtn.onclick = async () => {
+  sweepBtn.disabled = true;
+  const savedEta = P.eta;
+  const etas = [];
+  const phis = [];
+  for (let eta = 0; eta <= 6.28; eta += 0.2) {
+    P.eta = eta;
+    document.getElementById('e').value = eta;
+    document.getElementById('ev').textContent = eta.toFixed(2);
+    // Let it equilibrate
+    await new Promise(r => setTimeout(r, 700));
+    // Sample mean over 500ms
+    const samples = [];
+    const start = performance.now();
+    while (performance.now() - start < 500) {
+      samples.push(computeOrder());
+      await new Promise(r => setTimeout(r, 30));
+    }
+    etas.push(eta);
+    phis.push(samples.reduce((a,b)=>a+b,0) / samples.length);
+  }
+  P.eta = savedEta;
+  document.getElementById('e').value = savedEta;
+  document.getElementById('ev').textContent = savedEta.toFixed(2);
+  sweepData = { etas, phis };
+  drawSweep();
+  sweepBtn.disabled = false;
+};
+
+function drawSweep() {
+  if (!sweepData) return;
+  const { etas, phis } = sweepData;
+  octx.fillStyle = 'rgba(2,16,25,0.95)';
+  octx.fillRect(0, 0, order.width, order.height);
+  octx.strokeStyle = '#143040';
+  for (let i = 0; i <= 4; i++) {
+    const y = i * order.height / 4;
+    octx.beginPath(); octx.moveTo(0, y); octx.lineTo(order.width, y); octx.stroke();
+  }
+  octx.fillStyle = '#6fd6ff';
+  octx.font = '11px ui-monospace';
+  octx.fillText('φ vs η  (phase transition)', 8, 14);
+  octx.fillText('1', 4, 28);
+  octx.fillText('0', 4, order.height - 4);
+  octx.fillText('η=0', 8, order.height - 4);
+  octx.fillText('2π', order.width - 24, order.height - 4);
+  octx.strokeStyle = '#ff9';
+  octx.lineWidth = 2;
+  octx.beginPath();
+  for (let i = 0; i < etas.length; i++) {
+    const x = (etas[i] / 6.28) * order.width;
+    const y = order.height - phis[i] * (order.height - 20) - 8;
+    if (i === 0) octx.moveTo(x, y); else octx.lineTo(x, y);
+  }
+  octx.stroke();
+  for (let i = 0; i < etas.length; i++) {
+    const x = (etas[i] / 6.28) * order.width;
+    const y = order.height - phis[i] * (order.height - 20) - 8;
+    octx.fillStyle = '#ff9';
+    octx.beginPath(); octx.arc(x, y, 2, 0, Math.PI * 2); octx.fill();
+  }
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
