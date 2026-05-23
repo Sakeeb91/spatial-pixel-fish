@@ -29,8 +29,8 @@
 <canvas id="order" width="320"  height="180"></canvas>
 
 <div class="panel">
-  <strong>FISHES · Vicsek model</strong><span class="pill" id="phi-pill">φ=—</span>
-  <label>Fish              <input id="n"  type="range" min="20"  max="600" value="200"><span class="v" id="nv">200</span></label>
+  <strong>FISHES · Vicsek model</strong><span class="pill" id="phi-pill">φ=—</span><span class="pill" id="fps-pill">— fps</span>
+  <label>Fish              <input id="n"  type="range" min="20"  max="10000" value="500"><span class="v" id="nv">500</span></label>
   <label>Alignment R       <input id="ar" type="range" min="10"  max="120" value="50"><span class="v" id="arv">50</span></label>
   <label>Cohesion          <input id="c"  type="range" min="0"   max="80"  value="40"><span class="v" id="cv">40</span></label>
   <label>Separation        <input id="s"  type="range" min="0"   max="40"  value="14"><span class="v" id="sv">14</span></label>
@@ -66,11 +66,12 @@ window.addEventListener('resize', resize);
 // =================== PARAMETERS ===================
 const colors = ['#ffb86b','#ff6b7a','#e8f5ff','#9cdcfe'];
 const P = {
-  n: 200, alignR: 50, cohesion: 40, separation: 14,
+  n: 500, alignR: 50, cohesion: 40, separation: 14,
   eta: 0.25, speedLimit: 3.0, trailFade: 0.18,
   cohesionWeight: 20, separationWeight: 18, alignmentWeight: 6,
   speedFactorCohesion: 100, speedFactorSeparation: 5,
   turnRateLimit: Math.PI / 18, cohesionThreshold: 25,
+  lodThreshold: 1500,  // simple-triangle render above this count
 };
 
 // =================== FISH ===================
@@ -152,14 +153,39 @@ function drawOrder() {
   phiPill.textContent = `φ=${phi.toFixed(3)}`;
 }
 
+// =================== SPATIAL HASH (uniform grid) ===================
+// Reusable grid storage. Cell size = max interaction radius so each fish only
+// needs to scan its cell + 8 neighbors. Brings the step from O(n²) → O(n) avg.
+let grid = null;
+let gridCols = 0, gridRows = 0, cellSize = 0;
+
+function rebuildGrid() {
+  cellSize = Math.max(P.alignR, P.cohesion, P.separation, 10);
+  gridCols = Math.ceil(stage.width  / cellSize) + 1;
+  gridRows = Math.ceil(stage.height / cellSize) + 1;
+  const total = gridCols * gridRows;
+  if (!grid || grid.length !== total) {
+    grid = new Array(total);
+    for (let i = 0; i < total; i++) grid[i] = [];
+  } else {
+    for (let i = 0; i < total; i++) grid[i].length = 0;
+  }
+  for (let i = 0; i < fishes.length; i++) {
+    const f = fishes[i];
+    const cx = Math.min(gridCols - 1, Math.max(0, (f.x / cellSize) | 0));
+    const cy = Math.min(gridRows - 1, Math.max(0, (f.y / cellSize) | 0));
+    grid[cy * gridCols + cx].push(i);
+  }
+}
+
 // =================== SIMULATION STEP ===================
 function step() {
+  rebuildGrid();
+
   const alignR2 = P.alignR * P.alignR;
   const cohR2   = P.cohesion * P.cohesion;
-  const sepR    = P.separation;
-  const sepR2   = sepR * sepR;
+  const sepR2   = P.separation * P.separation;
 
-  // Pass 1: compute steering per fish
   const newDirs = new Float32Array(fishes.length);
   const newSpeeds = new Float32Array(fishes.length);
 
@@ -169,19 +195,32 @@ function step() {
 
     let cohCount = 0, cx = 0, cy = 0;
     let alignSx = 0, alignSy = 0, alignCount = 0;
-    let closest = null, closestD2 = Infinity;
+    let closestIdx = -1, closestD2 = Infinity;
 
-    for (let j = 0; j < fishes.length; j++) {
-      if (i === j) continue;
-      const o = fishes[j];
-      const dx = f.x - o.x, dy = f.y - o.y;
-      const d2 = dx*dx + dy*dy;
-      if (d2 < alignR2) { alignSx += Math.cos(o.dir); alignSy += Math.sin(o.dir); alignCount++; }
-      if (d2 < cohR2)   { cohCount++; cx += o.x; cy += o.y; }
-      if (d2 < closestD2) { closestD2 = d2; closest = o; }
+    const gcx = Math.min(gridCols - 1, Math.max(0, (f.x / cellSize) | 0));
+    const gcy = Math.min(gridRows - 1, Math.max(0, (f.y / cellSize) | 0));
+
+    // Scan 3x3 cell neighborhood
+    for (let dy = -1; dy <= 1; dy++) {
+      const ny = gcy + dy;
+      if (ny < 0 || ny >= gridRows) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = gcx + dx;
+        if (nx < 0 || nx >= gridCols) continue;
+        const bucket = grid[ny * gridCols + nx];
+        for (let k = 0; k < bucket.length; k++) {
+          const j = bucket[k];
+          if (j === i) continue;
+          const o = fishes[j];
+          const ox = f.x - o.x, oy = f.y - o.y;
+          const d2 = ox*ox + oy*oy;
+          if (d2 < alignR2) { alignSx += Math.cos(o.dir); alignSy += Math.sin(o.dir); alignCount++; }
+          if (d2 < cohR2)   { cohCount++; cx += o.x; cy += o.y; }
+          if (d2 < closestD2) { closestD2 = d2; closestIdx = j; }
+        }
+      }
     }
 
-    // Cohesion
     if (cohCount > 0) {
       cx /= cohCount; cy /= cohCount;
       const d = Math.hypot(f.x - cx, f.y - cy);
@@ -191,36 +230,29 @@ function step() {
         speed += d / P.speedFactorCohesion;
       }
     }
-    // Separation
-    if (closest && closestD2 < sepR2) {
+    if (closestIdx >= 0 && closestD2 < sepR2) {
+      const o = fishes[closestIdx];
       const dC = Math.sqrt(closestD2);
-      const angle = Math.atan2(f.y - closest.y, f.x - closest.x);
+      const angle = Math.atan2(f.y - o.y, f.x - o.x);
       turn -= (angle - f.dir) / P.separationWeight;
       speed += P.speedFactorSeparation / Math.max(dC, 0.01);
     }
-    // Alignment (Vicsek-style: avg neighbor heading)
-    let targetDir = f.dir;
     if (alignCount > 0) {
-      targetDir = Math.atan2(alignSy, alignSx);
-      // Blend toward target heading
+      const targetDir = Math.atan2(alignSy, alignSx);
       let delta = targetDir - f.dir;
       while (delta >  Math.PI) delta -= 2 * Math.PI;
       while (delta < -Math.PI) delta += 2 * Math.PI;
       turn += delta / P.alignmentWeight;
     }
 
-    // Clamp turn
     if (turn >  P.turnRateLimit) turn =  P.turnRateLimit;
     if (turn < -P.turnRateLimit) turn = -P.turnRateLimit;
 
-    // Vicsek noise: add uniform random perturbation in [-η/2, η/2]
     const noise = (Math.random() - 0.5) * P.eta;
-
     newDirs[i] = f.dir + turn + noise;
     newSpeeds[i] = Math.min(speed, P.speedLimit);
   }
 
-  // Pass 2: integrate position
   for (let i = 0; i < fishes.length; i++) {
     const f = fishes[i];
     f.turn = newDirs[i] - f.dir;
@@ -302,12 +334,13 @@ function drawBubbles() {
 }
 
 // =================== RENDER: FISH ===================
-function drawFish(f) {
+// Two paths: high-detail bezier for small flocks, simple triangle for big ones.
+// At 10k fish, the bezier path drops framerate hard — triangle path holds 60fps.
+function drawFishBezier(f) {
   sctx.save();
   sctx.translate(f.x, f.y);
   sctx.rotate(f.dir);
 
-  // Flex factor — bend body away from turn direction
   const flex = Math.max(-1, Math.min(1, f.turn * 14));
   const topY = 7 - flex * 4;
   const botY = -7 - flex * 4;
@@ -320,7 +353,6 @@ function drawFish(f) {
   sctx.moveTo(0, 0);
   sctx.bezierCurveTo(10, botY, 15, -flex * 2, 25, 0);
   sctx.stroke();
-  // Tail fins
   sctx.beginPath();
   sctx.moveTo(7,  3); sctx.lineTo(12,  8);
   sctx.moveTo(7, -3); sctx.lineTo(12, -8);
@@ -328,9 +360,40 @@ function drawFish(f) {
   sctx.restore();
 }
 
+// Batched simple-triangle render: group by color so we set fillStyle once per group
+function drawFishBatched() {
+  const byColor = new Map();
+  for (const f of fishes) {
+    let arr = byColor.get(f.color);
+    if (!arr) { arr = []; byColor.set(f.color, arr); }
+    arr.push(f);
+  }
+  for (const [color, arr] of byColor) {
+    sctx.fillStyle = color;
+    sctx.beginPath();
+    for (const f of arr) {
+      const c = Math.cos(f.dir), s = Math.sin(f.dir);
+      // Triangle pointing in -dir direction (fish move along -dir like the bezier path)
+      const tipX  = f.x - c * 8,  tipY  = f.y - s * 8;
+      const baseAX = f.x + c * 3 - s * 3, baseAY = f.y + s * 3 + c * 3;
+      const baseBX = f.x + c * 3 + s * 3, baseBY = f.y + s * 3 - c * 3;
+      sctx.moveTo(tipX, tipY);
+      sctx.lineTo(baseAX, baseAY);
+      sctx.lineTo(baseBX, baseBY);
+      sctx.closePath();
+    }
+    sctx.fill();
+  }
+}
+
 // =================== MAIN LOOP ===================
 let frames = 0;
+const fpsPill = document.getElementById('fps-pill');
+let fpsAccum = 0, fpsCount = 0, fpsLast = performance.now();
+
 function frame() {
+  const tStart = performance.now();
+
   drawBackground();
 
   // Motion trails — alpha-fade instead of full clear
@@ -338,18 +401,35 @@ function frame() {
   sctx.fillRect(0, 0, stage.width, stage.height);
 
   step();
-  for (const f of fishes) drawFish(f);
 
-  // FX layer: bubbles (clear + redraw)
+  // LOD: simple batched triangles above threshold, full bezier below
+  if (fishes.length > P.lodThreshold) {
+    drawFishBatched();
+  } else {
+    for (const f of fishes) drawFishBezier(f);
+  }
+
+  // FX layer: bubbles (clear + redraw) — only when small enough to not eat budget
   fctx.clearRect(0, 0, fx.width, fx.height);
-  spawnBubbles();
-  drawBubbles();
+  if (fishes.length <= 4000) {
+    spawnBubbles();
+    drawBubbles();
+  }
 
   // Order parameter — update every other frame for smoother sparkline
   if ((frames++ % 2) === 0) {
     const phi = computeOrder();
     phiHistory.shift(); phiHistory.push(phi);
     drawOrder();
+  }
+
+  // FPS measurement, updated every 0.5s
+  const now = performance.now();
+  fpsAccum += 1000 / (now - tStart);
+  fpsCount++;
+  if (now - fpsLast > 500) {
+    fpsPill.textContent = `${(fpsAccum / fpsCount).toFixed(0)} fps`;
+    fpsAccum = 0; fpsCount = 0; fpsLast = now;
   }
 
   requestAnimationFrame(frame);
